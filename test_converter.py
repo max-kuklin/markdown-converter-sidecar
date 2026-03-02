@@ -231,10 +231,10 @@ class TestQueueLimit:
 # ── Converter function unit tests ────────────────────────────────────────────
 
 class TestConverterFunctions:
-    @patch("converter.subprocess.run")
-    def test_pandoc_success(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=0,
+    @patch("converter._run_with_memory_limit")
+    def test_pandoc_success(self, mock_rwml):
+        mock_rwml.return_value = subprocess.CompletedProcess(
+            [], returncode=0,
             stdout=b"# Converted\n\nText content.",
             stderr=b"",
         )
@@ -242,14 +242,16 @@ class TestConverterFunctions:
 
         result = pandoc_to_markdown("/tmp/test.docx")
         assert "Converted" in result
-        mock_run.assert_called_once()
-        args = mock_run.call_args[0][0]
-        assert args[0] == "pandoc"
+        mock_rwml.assert_called_once()
+        args = mock_rwml.call_args[1] if mock_rwml.call_args[1] else {}
+        cmd = mock_rwml.call_args[0][0] if mock_rwml.call_args[0] else args.get("cmd")
+        assert cmd[0] == "pandoc"
 
-    @patch("converter.subprocess.run")
-    def test_pandoc_failure_raises(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=1,
+    @patch("converter._run_with_memory_limit")
+    def test_pandoc_failure_raises(self, mock_rwml):
+        mock_rwml.return_value = subprocess.CompletedProcess(
+            [], returncode=1,
+            stdout=b"",
             stderr=b"pandoc: error reading file",
         )
         from converter import pandoc_to_markdown
@@ -257,18 +259,18 @@ class TestConverterFunctions:
         with pytest.raises(RuntimeError, match="Pandoc conversion failed"):
             pandoc_to_markdown("/tmp/bad.docx")
 
-    @patch("converter.subprocess.run")
-    def test_pandoc_timeout_raises(self, mock_run):
-        mock_run.side_effect = subprocess.TimeoutExpired(cmd="pandoc", timeout=120)
+    @patch("converter._run_with_memory_limit")
+    def test_pandoc_timeout_raises(self, mock_rwml):
+        mock_rwml.side_effect = subprocess.TimeoutExpired(cmd="pandoc", timeout=120)
         from converter import pandoc_to_markdown
 
         with pytest.raises(subprocess.TimeoutExpired):
             pandoc_to_markdown("/tmp/slow.docx", timeout=120)
 
-    @patch("converter.subprocess.run")
-    def test_markitdown_success(self, mock_run):
+    @patch("converter._run_with_memory_limit")
+    def test_markitdown_success(self, mock_rwml):
         expected_md = "| A | B |\n|---|---|\n| 1 | 2 |"
-        mock_run.return_value = subprocess.CompletedProcess(
+        mock_rwml.return_value = subprocess.CompletedProcess(
             [], returncode=0, stdout=expected_md.encode("utf-8"), stderr=b"",
         )
 
@@ -276,22 +278,23 @@ class TestConverterFunctions:
         result = markitdown_to_markdown("/tmp/data.xlsx")
         assert "| A | B |" in result
 
-    @patch("converter.subprocess.run")
-    def test_antiword_success(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=0,
+    @patch("converter._run_with_memory_limit")
+    def test_antiword_success(self, mock_rwml):
+        mock_rwml.return_value = subprocess.CompletedProcess(
+            [], returncode=0,
             stdout=b"Hello from a .doc file",
             stderr=b"",
         )
         result = antiword_to_markdown("/tmp/test.doc")
         assert "Hello from a .doc file" in result
-        args = mock_run.call_args[0][0]
-        assert args[0] == "antiword"
+        cmd = mock_rwml.call_args[0][0]
+        assert cmd[0] == "antiword"
 
-    @patch("converter.subprocess.run")
-    def test_antiword_failure_raises(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=1,
+    @patch("converter._run_with_memory_limit")
+    def test_antiword_failure_raises(self, mock_rwml):
+        mock_rwml.return_value = subprocess.CompletedProcess(
+            [], returncode=1,
+            stdout=b"",
             stderr=b"I can't open the file",
         )
         with pytest.raises(RuntimeError, match="antiword conversion failed"):

@@ -4,13 +4,13 @@ A lightweight memory-efficient HTTP API in a Docker Image that converts document
 
 ## Supported Formats
 
-| Extension | Converter | Notes |
-|-----------|-----------|-------|
-| `.rtf`, `.odt`, `.txt` | Pandoc | |
-| `.docx` | Pandoc → MarkItDown | Falls back to MarkItDown on Pandoc heap exhaustion (table-heavy documents) |
-| `.doc` | Auto-detected: RTF → Pandoc, OLE2 binary → antiword → MarkItDown → Pandoc fallback chain | |
-| `.pptx`, `.pdf` | MarkItDown | |
-| `.xls`, `.xlsx` | python-calamine (direct) | |
+| Extension | Converter |
+|-----------|-----------|
+| `.rtf`, `.odt`, `.txt` | Pandoc |
+| `.docx` | Pandoc → MarkItDown fallback |
+| `.doc` | Auto-detected: RTF → Pandoc, OLE2 → antiword → MarkItDown → Pandoc |
+| `.pptx`, `.pdf` | MarkItDown |
+| `.xls`, `.xlsx` | python-calamine |
 
 Password-protected Office files (`.docx`, `.xlsx`, `.pptx`) are detected and rejected early.
 
