@@ -485,13 +485,17 @@ class TestDocxConversion:
     @patch("converter.markitdown_to_markdown")
     @patch("converter.pandoc_to_markdown")
     def test_docx_falls_back_to_markitdown_on_heap_exhaustion(self, mock_pandoc, mock_markitdown):
-        """When Pandoc heap-exhausts on a .docx, should fall back to MarkItDown."""
+        """When Pandoc heap-exhausts on a .docx, should fall back to MarkItDown with remaining time."""
         mock_pandoc.side_effect = RuntimeError("Pandoc conversion failed: pandoc: Heap exhausted;")
         mock_markitdown.return_value = "# Fallback result"
-        result = convert("/fake/test.docx", ".docx")
+        result = convert("/fake/test.docx", ".docx", timeout=120)
         assert result == "# Fallback result"
         mock_pandoc.assert_called_once()
+        # Pandoc should only get half the budget for .docx
+        assert mock_pandoc.call_args.kwargs["timeout"] == 60
         mock_markitdown.assert_called_once()
+        # Fallback should receive remaining time, not the full timeout
+        assert mock_markitdown.call_args.kwargs["timeout"] <= 120
 
     @patch("converter.pandoc_to_markdown")
     def test_docx_non_heap_error_still_raises(self, mock_pandoc):
@@ -500,3 +504,17 @@ class TestDocxConversion:
         import pytest
         with pytest.raises(RuntimeError, match="some other error"):
             convert("/fake/test.docx", ".docx")
+
+    @patch("converter.markitdown_to_markdown")
+    @patch("converter.pandoc_to_markdown")
+    def test_docx_falls_back_to_markitdown_on_timeout(self, mock_pandoc, mock_markitdown):
+        """When Pandoc times out on a .docx, MarkItDown gets the remaining budget."""
+        mock_pandoc.side_effect = subprocess.TimeoutExpired(cmd="pandoc", timeout=60)
+        mock_markitdown.return_value = "# Fallback after timeout"
+        result = convert("/fake/test.docx", ".docx", timeout=120)
+        assert result == "# Fallback after timeout"
+        # Pandoc should only get half the budget for .docx
+        assert mock_pandoc.call_args.kwargs["timeout"] == 60
+        mock_markitdown.assert_called_once()
+        # MarkItDown gets the remaining time (roughly half since Pandoc used its half)
+        assert 10 <= mock_markitdown.call_args.kwargs["timeout"] <= 120

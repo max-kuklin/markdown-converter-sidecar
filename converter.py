@@ -5,6 +5,7 @@ import re
 import shutil
 import signal
 import sys
+import threading
 import time
 
 logger = logging.getLogger("converter")
@@ -150,6 +151,27 @@ def _run_with_memory_limit(
     killed_for_memory = False
     deadline = time.monotonic() + timeout
 
+    # Drain stdout/stderr in background threads to prevent pipe-buffer
+    # deadlock.  Without this, a child that writes more than the OS pipe
+    # buffer (~64 KB on Linux) blocks on write() while the parent blocks
+    # on wait() — neither side makes progress.
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+
+    def _drain(pipe, sink: list[bytes]):
+        while True:
+            chunk = pipe.read(65536)
+            if not chunk:
+                break
+            sink.append(chunk)
+
+    stdout_thread = threading.Thread(target=_drain, args=(proc.stdout, stdout_chunks))
+    stderr_thread = threading.Thread(target=_drain, args=(proc.stderr, stderr_chunks))
+    stdout_thread.daemon = True
+    stderr_thread.daemon = True
+    stdout_thread.start()
+    stderr_thread.start()
+
     try:
         while True:
             remaining = deadline - time.monotonic()
@@ -183,8 +205,10 @@ def _run_with_memory_limit(
         proc.wait()
         raise
 
-    stdout = proc.stdout.read()
-    stderr = proc.stderr.read()
+    stdout_thread.join(timeout=5)
+    stderr_thread.join(timeout=5)
+    stdout = b"".join(stdout_chunks)
+    stderr = b"".join(stderr_chunks)
     result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
     if killed_for_memory:
@@ -534,17 +558,35 @@ def convert(input_path: str, extension: str, timeout: int = DEFAULT_TIMEOUT) -> 
     converter = get_converter(ext)
     if converter == "pandoc":
         logger.info("[Converter] Using Pandoc for %s", extension)
+        # For .docx, cap Pandoc at half the budget so the MarkItDown
+        # fallback still has time within the overall CONVERSION_TIMEOUT.
+        pandoc_timeout = timeout // 2 if ext == ".docx" else timeout
+        start = time.monotonic()
         try:
-            return pandoc_to_markdown(input_path, timeout=timeout)
+            return pandoc_to_markdown(input_path, timeout=pandoc_timeout)
         except MemoryLimitExceeded:
             if ext == ".docx":
+                remaining = timeout - int(time.monotonic() - start)
+                if remaining < 10:
+                    raise
                 logger.warning("[Converter] Pandoc OOM for %s, falling back to MarkItDown", extension)
-                return markitdown_to_markdown(input_path, timeout=timeout)
+                return markitdown_to_markdown(input_path, timeout=remaining)
             raise
         except RuntimeError as e:
             if ext == ".docx" and "Heap exhausted" in str(e):
+                remaining = timeout - int(time.monotonic() - start)
+                if remaining < 10:
+                    raise
                 logger.warning("[Converter] Pandoc heap exhausted for %s, falling back to MarkItDown", extension)
-                return markitdown_to_markdown(input_path, timeout=timeout)
+                return markitdown_to_markdown(input_path, timeout=remaining)
+            raise
+        except subprocess.TimeoutExpired:
+            if ext == ".docx":
+                remaining = timeout - int(time.monotonic() - start)
+                if remaining < 10:
+                    raise
+                logger.warning("[Converter] Pandoc timed out for %s, falling back to MarkItDown", extension)
+                return markitdown_to_markdown(input_path, timeout=remaining)
             raise
     elif converter == "xlsx":
         logger.info("[Converter] Using calamine for %s", extension)

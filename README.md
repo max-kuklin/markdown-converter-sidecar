@@ -64,7 +64,7 @@ uvicorn app:app --port 8100
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
 | `MAX_UPLOAD_SIZE` | `10485760` (10MB) | Maximum upload size in bytes |
-| `CONVERSION_TIMEOUT` | `120` | Subprocess timeout in seconds |
+| `CONVERSION_TIMEOUT` | `120` | Per-request conversion timeout in seconds. For `.docx`, Pandoc gets the first half; on failure, MarkItDown gets the remainder. |
 | `MAX_CONCURRENT_CONVERSIONS` | `1` | Maximum parallel conversions |
 | `MAX_QUEUED_CONVERSIONS` | `5` | Maximum requests waiting in queue |
 | `PANDOC_MAX_HEAP` | `128m` | Pandoc RTS max heap size (`-M`); on heap exhaustion `.docx` files fall back to MarkItDown automatically |
