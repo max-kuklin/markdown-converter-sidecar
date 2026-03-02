@@ -309,11 +309,93 @@ sys.stdout.buffer.write("\n".join(parts).encode("utf-8"))
     return result.stdout.decode("utf-8", errors="replace")
 
 
+def _xlsx_to_markdown_xml(input_path: str, timeout: int = DEFAULT_TIMEOUT) -> str:
+    """Fallback: convert .xlsx to Markdown using stdlib zipfile + xml.etree.
+
+    Used when calamine cannot parse the file (e.g. unusual sheet types).
+    """
+    script = r'''
+import sys, zipfile, xml.etree.ElementTree as ET
+
+NS = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+WS_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+R_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+
+path = sys.argv[1]
+with zipfile.ZipFile(path) as z:
+    shared = []
+    if "xl/sharedStrings.xml" in z.namelist():
+        tree = ET.parse(z.open("xl/sharedStrings.xml"))
+        for si in tree.findall(".//s:si", NS):
+            texts = si.findall(".//s:t", NS)
+            shared.append("".join(t.text or "" for t in texts))
+
+    wb = ET.parse(z.open("xl/workbook.xml"))
+    rels = ET.parse(z.open("xl/_rels/workbook.xml.rels"))
+    rid_map = {}
+    for rel in rels.findall(f".//{{{REL_NS}}}Relationship"):
+        if WS_TYPE in rel.get("Type", ""):
+            t = rel.get("Target")
+            if t.startswith("/"):
+                t = t[1:]
+            elif not t.startswith("xl/"):
+                t = "xl/" + t
+            rid_map[rel.get("Id")] = t
+
+    parts = []
+    for sheet_el in wb.findall(".//s:sheet", NS):
+        name = sheet_el.get("name")
+        rid = sheet_el.get(R_ID)
+        sp = rid_map.get(rid)
+        if not sp or sp not in z.namelist():
+            continue
+        tree = ET.parse(z.open(sp))
+        rows = tree.findall(".//s:sheetData/s:row", NS)
+        if not rows:
+            continue
+        parts.append(f"## {name}")
+        for ri, row_el in enumerate(rows):
+            cells = []
+            for cell in row_el.findall("s:c", NS):
+                val = ""
+                v_el = cell.find("s:v", NS)
+                if v_el is not None and v_el.text:
+                    if cell.get("t") == "s":
+                        idx = int(v_el.text)
+                        val = shared[idx] if idx < len(shared) else ""
+                    else:
+                        val = v_el.text
+                is_el = cell.find("s:is", NS)
+                if is_el is not None:
+                    texts = is_el.findall(".//s:t", NS)
+                    val = "".join(t.text or "" for t in texts)
+                cells.append(val)
+            parts.append("| " + " | ".join(cells) + " |")
+            if ri == 0:
+                parts.append("| " + " | ".join("---" for _ in cells) + " |")
+        parts.append("")
+    sys.stdout.buffer.write("\n".join(parts).encode("utf-8"))
+'''
+    result = _run_with_memory_limit(
+        [sys.executable, "-c", script, input_path],
+        timeout=timeout,
+        converter_name="xlsx_xml_fallback",
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        clean_msg = _extract_exception_message(stderr)
+        logger.error("[Converter] xlsx XML fallback stderr: %s", stderr)
+        raise RuntimeError(f"XLSX conversion failed: {clean_msg}")
+    return result.stdout.decode("utf-8", errors="replace")
+
+
 def xlsx_to_markdown(input_path: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     """Convert an .xlsx file to Markdown using python-calamine in a subprocess.
 
     Calamine (Rust-based) is fast, tolerant of unusual styles/fills that
     trip up openpyxl, and already used for .xls files.
+    Falls back to a stdlib XML parser if calamine cannot handle the file.
     """
     script = r'''
 import sys
@@ -340,12 +422,13 @@ sys.stdout.buffer.write("\n".join(parts).encode("utf-8"))
         timeout=timeout,
         converter_name="xlsx_to_markdown",
     )
-    if result.returncode != 0:
-        stderr = result.stderr.decode("utf-8", errors="replace").strip()
-        clean_msg = _extract_exception_message(stderr)
-        logger.error("[Converter] xlsx_to_markdown stderr: %s", stderr)
-        raise RuntimeError(f"XLSX conversion failed: {clean_msg}")
-    return result.stdout.decode("utf-8", errors="replace")
+    if result.returncode == 0:
+        return result.stdout.decode("utf-8", errors="replace")
+
+    stderr = result.stderr.decode("utf-8", errors="replace").strip()
+    logger.warning("[Converter] calamine failed for .xlsx, trying XML fallback: %s",
+                   _extract_exception_message(stderr))
+    return _xlsx_to_markdown_xml(input_path, timeout=timeout)
 
 
 def get_converter(extension: str) -> str | None:

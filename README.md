@@ -10,7 +10,8 @@ A lightweight memory-efficient HTTP API in a Docker Image that converts document
 | `.docx` | Pandoc → MarkItDown fallback |
 | `.doc` | Auto-detected: RTF → Pandoc, OLE2 → antiword → MarkItDown → Pandoc |
 | `.pptx`, `.pdf` | MarkItDown |
-| `.xls`, `.xlsx` | python-calamine |
+| `.xls` | python-calamine |
+| `.xlsx` | python-calamine → stdlib XML fallback |
 
 Password-protected Office files (`.docx`, `.xlsx`, `.pptx`) are detected and rejected early.
 
