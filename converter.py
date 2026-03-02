@@ -3,7 +3,9 @@ import logging
 import os
 import re
 import shutil
+import signal
 import sys
+import time
 
 logger = logging.getLogger("converter")
 
@@ -46,13 +48,180 @@ SUPPORTED_EXTENSIONS = PANDOC_EXTENSIONS | MARKITDOWN_EXTENSIONS | {".doc"}
 DEFAULT_TIMEOUT = 120
 PANDOC_MAX_HEAP = os.environ.get("PANDOC_MAX_HEAP", "128m")
 
+# RSS limit for converter subprocesses in MB.  The parent polls the child's
+# RSS and kills it (SIGKILL) if it exceeds this threshold.
+# Set to 0 to disable.  Only enforced on Linux (inside the container).
+# For a 512 MB container, 350 MB leaves ~130 MB for the parent process + OS.
+SUBPROCESS_MEMORY_LIMIT_MB = int(os.environ.get("SUBPROCESS_MEMORY_LIMIT_MB", 350))
+
+# How often (seconds) to check the child's RSS while it runs.
+# procfs reads are negligible (~microseconds per PID in the container),
+# so polling at 100ms adds no meaningful overhead.
+_RSS_POLL_INTERVAL = 0.1
+
+
+class MemoryLimitExceeded(Exception):
+    """Raised when a conversion subprocess exceeds its memory limit."""
+
+
+def _get_rss_bytes(pid: int) -> int | None:
+    """Read resident set size of *pid* from /proc on Linux.
+
+    Returns RSS in bytes, or None if unavailable (non-Linux / process gone).
+    """
+    try:
+        with open(f"/proc/{pid}/statm", "rb") as f:
+            # statm fields: size resident shared text lib data dt  (pages)
+            pages = int(f.read().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _get_process_group_rss_bytes(pgid: int) -> int | None:
+    """Sum RSS of all processes in process group *pgid* via /proc.
+
+    This captures the direct child plus any grandchildren (e.g. if
+    markitdown or pandoc spawns helper processes).
+    Returns total RSS in bytes, or None if /proc is unavailable.
+    """
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    total = 0
+    found = False
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat", "rb") as f:
+                    stat_data = f.read()
+                # Parse: pid (comm) state ppid pgrp ...
+                # comm can contain spaces/parens, so find the last ')' first
+                close_paren = stat_data.rindex(b")")
+                fields_after = stat_data[close_paren + 2:].split()
+                # fields_after[0]=state, [1]=ppid, [2]=pgrp
+                pgrp = int(fields_after[2])
+                if pgrp != pgid:
+                    continue
+                with open(f"/proc/{entry}/statm", "rb") as f:
+                    pages = int(f.read().split()[1])
+                total += pages * page_size
+                found = True
+            except (OSError, ValueError, IndexError):
+                continue
+    except OSError:
+        return None
+    return total if found else None
+
+
+def _run_with_memory_limit(
+    cmd: list,
+    timeout: int,
+    converter_name: str,
+) -> subprocess.CompletedProcess:
+    """Run *cmd* as a subprocess, killing it if RSS exceeds the limit.
+
+    The child is started in its own process group (``start_new_session``),
+    so the watchdog sums RSS across the whole group — covering any
+    grandchild processes the converter may spawn.
+
+    On non-Linux or when the limit is disabled this falls back to plain
+    subprocess.run() with the same timeout.
+    """
+    limit_bytes = SUBPROCESS_MEMORY_LIMIT_MB * 1024 * 1024
+    use_watchdog = (
+        sys.platform != "win32"
+        and limit_bytes > 0
+        and os.path.isdir("/proc")
+    )
+
+    if not use_watchdog:
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        _check_memory_failure(result, converter_name)
+        return result
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    pgid = os.getpgid(proc.pid)
+    killed_for_memory = False
+    deadline = time.monotonic() + timeout
+
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                os.killpg(pgid, signal.SIGKILL)
+                proc.wait()
+                raise subprocess.TimeoutExpired(cmd, timeout)
+
+            try:
+                proc.wait(timeout=min(_RSS_POLL_INTERVAL, remaining))
+                break  # process finished
+            except subprocess.TimeoutExpired:
+                pass  # still running — check RSS
+
+            rss = _get_process_group_rss_bytes(pgid)
+            if rss is not None and rss > limit_bytes:
+                logger.warning(
+                    "[Converter] %s exceeded RSS limit (%d MB > %d MB), killing",
+                    converter_name, rss // (1024 * 1024),
+                    SUBPROCESS_MEMORY_LIMIT_MB,
+                )
+                os.killpg(pgid, signal.SIGKILL)
+                proc.wait()
+                killed_for_memory = True
+                break
+    except Exception:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+        proc.wait()
+        raise
+
+    stdout = proc.stdout.read()
+    stderr = proc.stderr.read()
+    result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+    if killed_for_memory:
+        raise MemoryLimitExceeded(
+            f"{converter_name}: process killed (RSS exceeded "
+            f"{SUBPROCESS_MEMORY_LIMIT_MB} MB limit)"
+        )
+
+    _check_memory_failure(result, converter_name)
+    return result
+
+
+def _check_memory_failure(result: subprocess.CompletedProcess,
+                          converter_name: str) -> None:
+    """Raise MemoryLimitExceeded if the subprocess died from memory exhaustion."""
+    if result.returncode == 0:
+        return
+    # Killed by signal 9 (OOM killer)
+    if result.returncode in (-9, 137):
+        raise MemoryLimitExceeded(
+            f"{converter_name}: process killed (out of memory)"
+        )
+    stderr = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+    if "MemoryError" in stderr or "Cannot allocate memory" in stderr:
+        raise MemoryLimitExceeded(f"{converter_name}: out of memory")
+    if "Heap exhausted" in stderr:
+        raise MemoryLimitExceeded(
+            f"{converter_name}: out of memory (heap exhausted)"
+        )
+
 
 def antiword_to_markdown(input_path: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     """Convert a legacy .doc file to plain text using antiword CLI."""
-    result = subprocess.run(
+    result = _run_with_memory_limit(
         ["antiword", input_path],
-        capture_output=True,
         timeout=timeout,
+        converter_name="antiword",
     )
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
@@ -62,11 +231,11 @@ def antiword_to_markdown(input_path: str, timeout: int = DEFAULT_TIMEOUT) -> str
 
 def pandoc_to_markdown(input_path: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     """Convert a document to Markdown using Pandoc CLI."""
-    result = subprocess.run(
+    result = _run_with_memory_limit(
         ["pandoc", "+RTS", f"-M{PANDOC_MAX_HEAP}", "-RTS",
          input_path, "-t", "markdown", "--wrap=none"],
-        capture_output=True,
         timeout=timeout,
+        converter_name="pandoc",
     )
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
@@ -80,7 +249,7 @@ def markitdown_to_markdown(input_path: str, timeout: int = DEFAULT_TIMEOUT) -> s
     Running in a subprocess ensures all memory is returned to the OS when
     the conversion finishes, instead of fragmenting the main process heap.
     """
-    result = subprocess.run(
+    result = _run_with_memory_limit(
         [
             sys.executable, "-c",
             "import sys; "
@@ -90,8 +259,8 @@ def markitdown_to_markdown(input_path: str, timeout: int = DEFAULT_TIMEOUT) -> s
             "sys.stdout.buffer.write(r.text_content.encode('utf-8'))",
             input_path,
         ],
-        capture_output=True,
         timeout=timeout,
+        converter_name="markitdown",
     )
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
@@ -127,10 +296,10 @@ for name in wb.sheet_names:
     parts.append("")
 sys.stdout.buffer.write("\n".join(parts).encode("utf-8"))
 '''
-    result = subprocess.run(
+    result = _run_with_memory_limit(
         [sys.executable, "-c", script, input_path],
-        capture_output=True,
         timeout=timeout,
+        converter_name="xls_to_markdown",
     )
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
@@ -166,10 +335,10 @@ for name in wb.sheet_names:
     parts.append("")
 sys.stdout.buffer.write("\n".join(parts).encode("utf-8"))
 '''
-    result = subprocess.run(
+    result = _run_with_memory_limit(
         [sys.executable, "-c", script, input_path],
-        capture_output=True,
         timeout=timeout,
+        converter_name="xlsx_to_markdown",
     )
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
@@ -284,6 +453,11 @@ def convert(input_path: str, extension: str, timeout: int = DEFAULT_TIMEOUT) -> 
         logger.info("[Converter] Using Pandoc for %s", extension)
         try:
             return pandoc_to_markdown(input_path, timeout=timeout)
+        except MemoryLimitExceeded:
+            if ext == ".docx":
+                logger.warning("[Converter] Pandoc OOM for %s, falling back to MarkItDown", extension)
+                return markitdown_to_markdown(input_path, timeout=timeout)
+            raise
         except RuntimeError as e:
             if ext == ".docx" and "Heap exhausted" in str(e):
                 logger.warning("[Converter] Pandoc heap exhausted for %s, falling back to MarkItDown", extension)

@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from python_multipart.multipart import parse_options_header
 
-from converter import SUPPORTED_EXTENSIONS, convert, get_converter
+from converter import SUPPORTED_EXTENSIONS, MemoryLimitExceeded, convert, get_converter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("converter")
@@ -224,6 +224,9 @@ async def convert_file(request: Request):
         raise HTTPException(status_code=415, detail=detail)
     except HTTPException:
         raise
+    except MemoryLimitExceeded as e:
+        logger.warning("[Converter] Memory limit exceeded: %s", str(e))
+        raise HTTPException(status_code=507, detail=str(e))
     except TimeoutError:
         raise HTTPException(status_code=504, detail="Conversion timed out")
     except subprocess.TimeoutExpired:
